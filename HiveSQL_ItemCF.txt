@@ -1,0 +1,167 @@
+--#==================================
+--#@AUTHOR:belle.lan@vipshop.com
+--#@SINCE:2018-06-11
+--#DESC:
+--#PROJECT:  好物说栏目（发现调性高质感高 非爆款较小众的商品）
+--#METHOD: 基于物品的协同过滤itemcf（欧式距离eucli_sim/余弦相似度cos_sim/杰卡德系数jaccard_sim）
+--#FEATURE:  限定时间内是否购买为特征bool_buy
+--#DURATION:30days/90days
+--#TASK SERIES: [207548]基本特征构造 -> [207549]协同过滤物品相似阵 -> [207551]好物说商品TOP-100推荐
+--#==================================
+--#协同过滤物品相似阵
+
+
+set hive.exec.reducers.bytes.per.reducer=300000000;
+set mapreduce.input.fileinputformat.split.maxsize=200000000;
+====step:0====
+--filter those records without any purchase data to decrease the dimension of the metric
+----USER DEGREE---
+DROP TABLE IF EXISTS temp_bigdata.itemcf_goods_user_30_90;
+CREATE TABLE temp_bigdata.itemcf_goods_user_30_90 AS 
+SELECT spu_id,user_id
+       ,count(distinct case when sales_money_30 <>0 then spu_id else null end) as user_link_30
+	   ,count(distinct spu_id) as user_link_90		
+FROM  temp_bigdata.itemcf_season_norstr_noold_flow_filter
+ WHERE
+ sales_money_90<>0
+ GROUP BY spu_id,user_id;
+ 
+----ITEM DEGREE---
+DROP TABLE IF EXISTS temp_bigdata.itemcf_goods_item_30_90;
+CREATE TABLE temp_bigdata.itemcf_goods_item_30_90 AS 
+SELECT spu_id
+       ,count(distinct case when sales_money_30 <>0 then user_id else null end) as item_link_30
+		,count(distinct user_id) as item_link_90		
+  FROM temp_bigdata.itemcf_season_norstr_noold_flow_filter
+ WHERE
+ sales_money_90<>0
+ GROUP BY spu_id;
+
+
+ 
+ ====step:1====
+--------BASE FEATURE-----
+DROP TABLE IF EXISTS temp_bigdata.itemcf_buy_feature_30_90;
+CREATE TABLE temp_bigdata.itemcf_buy_feature_30_90 AS 
+SELECT a.user_id,a.spu_id,a.is_hws
+		,COALESCE(a.bool_buy_30,0) AS bool_buy_30
+		,COALESCE(a.bool_buy_90,0) AS bool_buy_90
+		,COALESCE(b.user_link_30,0) AS user_link_30
+		,COALESCE(c.item_link_30,0) AS item_link_30
+		,COALESCE(b.user_link_90,0) AS user_link_90
+		,COALESCE(c.item_link_90,0) AS item_link_90
+  FROM temp_bigdata.itemcf_season_norstr_noold_flow_filter a
+  LEFT OUTER JOIN temp_bigdata.itemcf_goods_user_30_90 b
+    ON a.user_id=b.user_id and a.spu_id=b.spu_id
+  LEFT OUTER JOIN temp_bigdata.itemcf_goods_item_30_90 c
+    ON a.spu_id=c.spu_id;
+	
+	
+ ====step:2====
+ ----ITEM SIMILARITY----
+ ----MATRIX CALCULATE FEATURE----
+DROP TABLE IF EXISTS temp_bigdata.itemcf_buy_matrix_feature_30_90;
+CREATE TABLE temp_bigdata.itemcf_buy_matrix_feature_30_90 AS 
+SELECT a.user_id AS user_id
+	   ,a.user_link_30 AS user_link_30 
+	   ,a.user_link_90 AS user_link_90 
+		,a.spu_id AS spu_id_a
+		,b.spu_id AS spu_id_b
+		,a.is_hws AS is_hws_a
+		,b.is_hws AS is_hws_b
+		,a.bool_buy_30  AS bool_buy_30_a
+		,b.bool_buy_30  AS bool_buy_30_b
+		,a.item_link_30  AS item_link_30_a
+		,b.item_link_30  AS item_link_30_b				
+		,a.bool_buy_90  AS bool_buy_90_a
+		,b.bool_buy_90  AS bool_buy_90_b
+		,a.item_link_90  AS item_link_90_a
+		,b.item_link_90  AS item_link_90_b	
+  FROM (SELECT * 
+		  FROM temp_bigdata.itemcf_buy_feature_30_90
+		WHERE user_link_90<>0  
+		 AND item_link_90<>0 
+		 AND bool_buy_90<>0) a
+  JOIN (SELECT * 
+			FROM temp_bigdata.itemcf_buy_feature_30_90
+            WHERE user_link_90<>0 
+			AND item_link_90<>0 
+			AND bool_buy_90<>0) b
+    ON a.user_id=b.user_id;
+	
+ ====step:3====
+  ----MATRIX CALCULATE----
+DROP TABLE IF EXISTS temp_bigdata.itemcf_buy_matrix_base_30_90;
+CREATE TABLE temp_bigdata.itemcf_buy_matrix_base_30_90 AS 
+SELECT spu_id_a,spu_id_b,is_hws_a,is_hws_b
+		,sum(bool_buy_30_a*bool_buy_30_b) AS sigma_itemcf_30
+		,sum(bool_buy_90_a*bool_buy_90_b) AS sigma_itemcf_90
+ FROM temp_bigdata.itemcf_buy_matrix_feature_30_90
+ GROUP BY spu_id_a,spu_id_b,is_hws_a,is_hws_b;
+
+
+
+ ====step:4====
+DROP TABLE IF EXISTS temp_bigdata.itemcf_buy_matrix_30_90;
+CREATE TABLE temp_bigdata.itemcf_buy_matrix_30_90 AS 
+SELECT x.spu_id_a,x.spu_id_b,x.is_hws_a,x.is_hws_b
+		,max(1/(1+sqrt(item_link_30_a+item_link_30_b ))) AS eucli_sim_30
+		,max(sigma_itemcf_30 / (sqrt(item_link_30_a*item_link_30_b))) AS cos_sim_30 	-- A∩B/(A∪B)
+		,max(sigma_itemcf_30/(item_link_30_a+item_link_30_b-sigma_itemcf_30)) AS jaccard_sim_30 -- A∩B/(A+B-A∩B) --discrete
+		,max(1/(1+sqrt(item_link_90_a+item_link_90_b ))) AS eucli_sim_90
+		,max(sigma_itemcf_90 / (sqrt(item_link_90_a*item_link_90_b))) AS cos_sim_90 	-- A∩B/(A∪B)
+		,max(sigma_itemcf_90/(item_link_90_a+item_link_90_b-sigma_itemcf_90)) AS jaccard_sim_90 -- A∩B/(A+B-A∩B) --discrete
+FROM  temp_bigdata.itemcf_buy_matrix_base_30_90 x
+JOIN temp_bigdata.itemcf_buy_matrix_feature_30_90 y
+ON x.spu_id_a = y.spu_id_a and  x.spu_id_b = y.spu_id_b
+WHERE x.spu_id_a IS NOT NULL 
+AND x.spu_id_b IS NOT NULL
+GROUP BY x.spu_id_a,x.spu_id_b,x.is_hws_a,x.is_hws_b;
+
+--整理写入表
+====step:5====
+create table if not exists vipmodel.spuid_similarity_history
+(spu_id_a string,
+spu_id_b string,
+is_hws_a int,
+is_hws_b int,
+eucli_sim_30 double,
+cos_sim_30 double,
+jaccard_sim_30 double,
+eucli_sim_90 double,
+cos_sim_90 double,
+jaccard_sim_90 double
+) partitioned by (dt string)
+;
+
+insert overwrite table vipmodel.spuid_similarity_history partition (dt='${dt}')
+select
+spu_id_a,
+spu_id_b,
+is_hws_a,
+is_hws_b,
+eucli_sim_30,
+cos_sim_30,
+jaccard_sim_30,
+eucli_sim_90,
+cos_sim_90,
+jaccard_sim_90
+from temp_bigdata.itemcf_buy_matrix_30_90
+;
+
+drop table if exists vipmodel.spuid_similarity;
+create table vipmodel.spuid_similarity as
+select
+spu_id_a,
+spu_id_b,
+is_hws_a,
+is_hws_b,
+eucli_sim_30,
+cos_sim_30,
+jaccard_sim_30,
+eucli_sim_90,
+cos_sim_90,
+jaccard_sim_90
+from vipmodel.spuid_similarity_history
+where dt='${dt}'
+;
