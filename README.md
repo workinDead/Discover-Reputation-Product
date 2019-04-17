@@ -1,5 +1,5 @@
 # Discover-Reputation-Product
-Big Data Intern Recommendation System @ VIPS Zhimin Feng
+Big Data Intern Recommendation System @ VIPS(NYSE) Zhimin Feng
 
 - Introduction about VIPS: https://en.wikipedia.org/wiki/Vipshop
 
